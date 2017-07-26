@@ -1,14 +1,19 @@
 var KrakenClient = require('kraken-api'),
   path = require('path'),
+  minimist = require('minimist'),
   moment = require('moment'),
   n = require('numbro'),
   colors = require('colors')
 
 module.exports = function container(get, set, clear) {
   var c = get('conf')
+  var s = {options: minimist(process.argv)}
+  var so = s.options
 
   var public_client, authed_client
-  var recoverableErrors = new RegExp(/(ESOCKETTIMEDOUT|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|API:Invalid nonce|API:Rate limit exceeded)/)
+  // var recoverableErrors = new RegExp(/(ESOCKETTIMEDOUT|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|API:Invalid nonce|API:Rate limit exceeded|between Cloudflare and the origin web server)/)
+  var recoverableErrors = new RegExp(/(ESOCKETTIMEDOUT|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|API:Invalid nonce|between Cloudflare and the origin web server)/)
+  var silencedRecoverableErrors = new RegExp(/(ESOCKETTIMEDOUT|ETIMEDOUT)/)
 
   function publicClient() {
     if (!public_client) {
@@ -35,12 +40,17 @@ module.exports = function container(get, set, clear) {
     if (error.message.match(/API:Rate limit exceeded/)) {
       var timeout = 10000
     } else {
-      var timeout = 2500
+      var timeout = 150
     }
 
     // silence common timeout errors
-    if (error.code !== 'ETIMEDOUT') {
-      console.warn(('\nKraken API warning - unable to call ' + method + ' (' + error + '), retrying in ' + timeout / 1000 + 's').yellow)
+    if (so.debug || !error.message.match(silencedRecoverableErrors)) {
+      if (error.message.match(/between Cloudflare and the origin web server/)) {
+        errorMsg = 'Connection between Cloudflare CDN and api.kraken.com failed'
+      } else {
+        errorMsg = error
+      }
+      console.warn(('\nKraken API warning - unable to call ' + method + ' (' + errorMsg + '), retrying in ' + timeout / 1000 + 's').yellow)
     }
     setTimeout(function () {
       exchange[method].apply(exchange, args)
@@ -122,12 +132,12 @@ module.exports = function container(get, set, clear) {
           return cb(data.error.join(','))
         }
         if (data.result[opts.currency]) {
-          balance.currency = n(data.result[opts.currency]).format('0.00000000'),
-            balance.currency_hold = 0
+          balance.currency = n(data.result[opts.currency]).format('0.00000000')
+          balance.currency_hold = 0
         }
         if (data.result[opts.asset]) {
-          balance.asset = n(data.result[opts.asset]).format('0.00000000'),
-            balance.asset_hold = 0
+          balance.asset = n(data.result[opts.asset]).format('0.00000000')
+          balance.asset_hold = 0
         }
         cb(null, balance)
       })
@@ -175,7 +185,11 @@ module.exports = function container(get, set, clear) {
         if (data.error.length) {
           return cb(data.error.join(','))
         }
-        cb(null)
+        if (so.debug) {
+          console.log("cancelOrder")
+          console.log(data)
+        }
+        cb(error)
       })
     },
 
@@ -185,13 +199,19 @@ module.exports = function container(get, set, clear) {
       var params = {
         pair: joinProduct(opts.product_id),
         type: type,
-        ordertype: (opts.order_type === 'maker' ? 'limit' : 'market'),
+        ordertype: (opts.order_type === 'taker' ? 'market' : 'limit'),
         volume: opts.size,
-        trading_agreement: c.kraken.tosagree,
-        oflags: opts.post_only === true && opts.order_type === 'maker' ? 'post' : undefined
+        trading_agreement: c.kraken.tosagree
+      }
+      if (opts.post_only === true && params.ordertype === 'limit') {
+        params.oflags = 'post'
       }
       if ('price' in opts) {
         params.price = opts.price
+      }
+      if (so.debug) {
+        console.log("trade")
+        console.log(params)
       }
       client.api('AddOrder', params, function (error, data) {
         if (error && error.message.match(recoverableErrors)) {
@@ -209,6 +229,15 @@ module.exports = function container(get, set, clear) {
 
         if (opts.order_type === 'maker') {
           order.post_only = !!opts.post_only
+        }
+
+        if (so.debug) {
+          console.log("Data")
+          console.log(data)
+          console.log("Order")
+          console.log(order)
+          console.log("Error")
+          console.log(error)
         }
 
         if (error) {
@@ -264,22 +293,27 @@ module.exports = function container(get, set, clear) {
           return cb(data.error.join(','))
         }
         var orderData = data.result[params.txid]
+        if (so.debug) {
+          console.log("QueryOrders")
+          console.log(orderData)
+        }
 
         if (!orderData) {
           return cb('Order not found')
         }
 
         if (orderData.status === 'canceled' && orderData.reason === 'Post only order') {
-          order.status = 'rejected'
+          order.status = 'done'
           order.reject_reason = 'post only'
           order.done_at = new Date().getTime()
+          order.filled_size = n(orderData.vol_exec).format('0.00000000')
           return cb(null, order)
         }
 
-        if (orderData.status === 'closed') {
+        if (orderData.status === 'closed' || (orderData.status === 'canceled' && orderData.reason === 'User canceled')) {
           order.status = 'done'
           order.done_at = new Date().getTime()
-          order.filled_size = parseFloat(orderData.vol) - parseFloat(orderData.vol_exec)
+          order.filled_size = n(orderData.vol_exec).format('0.00000000')
           return cb(null, order)
         }
 
